@@ -299,12 +299,24 @@ def get_hswaps_full_signed(model, layer, features: list[Feature], k, val, signs:
 
     sae = SAEConfig(model_name=model.cfg.tokenizer_name, layer=layer, type="mlp", size=size, device=str(model.cfg.device)).get().float()
 
+    # SAEs always load fp32 (no dtype override exists for them -- see SAEConfig.get()
+    # above), but the model itself may be bf16 (a GPU memory optimization). Every op
+    # below that mixes W_out with SAE tensors needs matching dtypes -- @ (matmul/addmv)
+    # raises outright on a mismatch, and even ops that silently type-promote (+/-) would
+    # otherwise make sae.encode/decode operate on upcast-then-downcast intermediates.
+    # Bridge to fp32 once here (one d_mlp x d_model matrix per layer, ~85MB for
+    # Gemma-2-2B -- a one-time cost per edited layer, not per forward pass) and cast
+    # back to the model's native dtype at the end, rather than forcing the whole model
+    # to fp32 just to satisfy this function.
+    model_dtype = model.blocks[layer].mlp.W_out.dtype
+    w_out = model.blocks[layer].mlp.W_out.float()
+
     hindices = DefaultDict(list)
 
     total_max = 0
     total_max_index_encoded = 0
     for feature in features:
-        encoded = model.blocks[layer].mlp.W_out @ sae.W_enc[:, feature.id]
+        encoded = w_out @ sae.W_enc[:, feature.id]
 
         thresh = encoded.abs().max() * k
 
@@ -312,19 +324,19 @@ def get_hswaps_full_signed(model, layer, features: list[Feature], k, val, signs:
 
         high_indices = torch.where(encoded.abs() > thresh)[0].tolist()
         for index in high_indices:
-            index_encoded = model.blocks[layer].mlp.W_out[index] @ sae.W_enc
+            index_encoded = w_out[index] @ sae.W_enc
             max_index_encoded = index_encoded.abs().max()
             total_max_index_encoded = max(max_index_encoded, total_max_index_encoded)
             hindices[index].append((feature, signs[layer, index], max_index_encoded))
 
     hswaps = []
     for index, swap_features in hindices.items():
-        clean = model.blocks[layer].mlp.W_out[index]
-        dirty = sae.decode(sae.encode(model.blocks[layer].mlp.W_out[index]))
+        clean = w_out[index]
+        dirty = sae.decode(sae.encode(w_out[index]))
 
         error_term = clean - dirty
 
-        proj = sae.encode(model.blocks[layer].mlp.W_out[index])
+        proj = sae.encode(w_out[index])
 
         if all_features:
             for feature in features:
@@ -337,12 +349,12 @@ def get_hswaps_full_signed(model, layer, features: list[Feature], k, val, signs:
                 # proj[feature.id] = total_max_index_encoded * val * sign_int * msign
                 # proj[feature.id] = max_index_encoded * val * sign_int * msign
                 # print(f"[{index}] proj[{feature.id}] = {proj[feature.id]}")
-        
+
         affected = sae.decode(proj)
         fixed_affected = affected + error_term
-        
+
         if not torch.allclose(fixed_affected, clean):
-            hswaps.append((index, fixed_affected))
+            hswaps.append((index, fixed_affected.to(model_dtype)))
 
     return hswaps
 
@@ -369,11 +381,17 @@ def get_hswaps_full(model, layer, features: list[Feature], k, val, all_features=
 
     sae = SAEConfig(model_name=model.cfg.tokenizer_name, layer=layer, type="mlp", size=size, device=str(model.cfg.device)).get().float()
 
+    # See get_hswaps_full_signed's identical comment above: SAEs always load fp32, the
+    # model may be bf16, and @ (matmul/addmv) requires matching dtypes -- bridge to fp32
+    # once per layer here instead of forcing the whole model to fp32.
+    model_dtype = model.blocks[layer].mlp.W_out.dtype
+    w_out = model.blocks[layer].mlp.W_out.float()
+
     hindices = DefaultDict(list)
 
     total_max = 0
     for feature in features:
-        encoded = model.blocks[layer].mlp.W_out @ sae.W_enc[:, feature.id]
+        encoded = w_out @ sae.W_enc[:, feature.id]
 
         thresh = encoded.abs().max() * k
 
@@ -381,19 +399,19 @@ def get_hswaps_full(model, layer, features: list[Feature], k, val, all_features=
 
         high_indices = torch.where(encoded.abs() > thresh)[0].tolist()
         for index in high_indices:
-            index_encoded = model.blocks[layer].mlp.W_out[index] @ sae.W_enc
+            index_encoded = w_out[index] @ sae.W_enc
             max_index_encoded = index_encoded.abs().max()
 
             hindices[index].append((feature, encoded[index] >= 0, max_index_encoded))
 
     hswaps = []
     for index, swap_features in hindices.items():
-        clean = model.blocks[layer].mlp.W_out[index]
-        dirty = sae.decode(sae.encode(model.blocks[layer].mlp.W_out[index]))
+        clean = w_out[index]
+        dirty = sae.decode(sae.encode(w_out[index]))
 
         error_term = clean - dirty
 
-        proj = sae.encode(model.blocks[layer].mlp.W_out[index])
+        proj = sae.encode(w_out[index])
 
         if all_features:
             for feature in features:
@@ -404,12 +422,12 @@ def get_hswaps_full(model, layer, features: list[Feature], k, val, all_features=
                 sign_int = -1 if feature.neg else 1
                 proj[feature.id] = total_max * val * sign_int
                 # print(f"[{index}] proj[{feature.id}] = {proj[feature.id]}")
-        
+
         affected = sae.decode(proj)
         fixed_affected = affected + error_term
-        
+
         if not torch.allclose(fixed_affected, clean):
-            hswaps.append((index, fixed_affected))
+            hswaps.append((index, fixed_affected.to(model_dtype)))
 
     return hswaps
 
