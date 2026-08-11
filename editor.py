@@ -231,7 +231,22 @@ class Concept(DataClassJsonMixin):
 def get_mlp_act_signs(model, tokens, text, batch_size=3):
     token_ids = [model.to_single_token(token) for token in tokens]
 
-    n_prompts = 100000
+    # The original hardcoded n_prompts=100000 here pre-allocates a
+    # (n_layers, d_mlp, 100000) float32 buffer regardless of input size --
+    # ~89GB for Gemma-2-2B-it, which OOMs on any machine without ~90GB free.
+    # Right-size it instead: count how many (token match x layer) slots the
+    # fill loop below will actually write (matches the loop's own count
+    # increment, which fires once per layer per matching token position),
+    # via a tokenize-only pre-pass -- no forward pass, so this is cheap.
+    n_matches = 0
+    for i in range(0, len(text), batch_size):
+        batch = text[i:i+batch_size]
+        toks = model.to_tokens(batch)
+        for batch_toks in toks:
+            for tok in batch_toks:
+                if tok.item() in token_ids:
+                    n_matches += 1
+    n_prompts = max(n_matches * model.cfg.n_layers, 1)
     acts = torch.zeros((model.cfg.n_layers, model.cfg.d_mlp, n_prompts))
 
     count = 0
@@ -282,7 +297,7 @@ def get_hswaps_full_signed(model, layer, features: list[Feature], k, val, signs:
         else:
             size = "32k"
 
-    sae = SAEConfig(model_name=model.cfg.tokenizer_name, layer=layer, type="mlp", size=size).get().float()
+    sae = SAEConfig(model_name=model.cfg.tokenizer_name, layer=layer, type="mlp", size=size, device=str(model.cfg.device)).get().float()
 
     hindices = DefaultDict(list)
 
@@ -352,7 +367,7 @@ def get_hswaps_full(model, layer, features: list[Feature], k, val, all_features=
         else:
             size = "32k"
 
-    sae = SAEConfig(model_name=model.cfg.tokenizer_name, layer=layer, type="mlp", size=size).get().float()
+    sae = SAEConfig(model_name=model.cfg.tokenizer_name, layer=layer, type="mlp", size=size, device=str(model.cfg.device)).get().float()
 
     hindices = DefaultDict(list)
 

@@ -1,9 +1,7 @@
+import os
 import re
 import time
 from transformers import PreTrainedModel
-
-from gcg_multiple import run as run_gcg
-from gcg_multiple import GCGConfig
 
 from tqdm import tqdm as _tqdm
 from tqdm import tqdm as Pbar
@@ -504,7 +502,7 @@ class OpenAIEvaluator(AbstractEvaluator):
         return completion.choices[0].message.content
 
 class GeminiEvaluator(AbstractEvaluator):
-    def __init__(self, model_name: str = "models/gemini-2.0-flash"):
+    def __init__(self, model_name: str = "models/gemini-flash-latest"):
         gai.configure(api_key=os.getenv("GEMINI_API_KEY"))
         self.model = gai.GenerativeModel(model_name)
 
@@ -837,6 +835,9 @@ def get_gcg_suffix_tl(model: HookedTransformer, questions: list[OpenEndedQuestio
     return get_gcg_suffix(hf_model, tokenizer, questions, steps)
 
 def get_gcg_suffix(model: AutoModelForCausalLM, tokenizer: AutoTokenizer, questions: list[OpenEndedQuestion], steps=1000) -> str:
+    from gcg_multiple import run as run_gcg
+    from gcg_multiple import GCGConfig
+
     config = GCGConfig(
         num_steps=steps,
         search_width=64,

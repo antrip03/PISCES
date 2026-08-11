@@ -1,3 +1,4 @@
+import os
 import torch
 import json
 import random
@@ -73,21 +74,50 @@ def get_feature_saes(model, features: list[Feature]):
 
     saes = []
     for layer in _tqdm(layers):
-        saes.append(SAEConfig(model.cfg.tokenizer_name, layer, "mlp", "16k" if "gemma" in model.cfg.tokenizer_name else "32k").get())
+        saes.append(SAEConfig(model.cfg.tokenizer_name, layer, "mlp", "16k" if "gemma" in model.cfg.tokenizer_name else "32k", device=str(model.cfg.device)).get())
 
     return saes
 
-def get_feature_effect(model, features: list[Feature], signs, forget_set: list[str], pos_toks_ids: list[int], neg_toks_ids: list[int], batch_size=3):
-    out = DefaultDict(list)
-    sim_outs = DefaultDict(list)
+def _save_checkpoint(checkpoint_path, data):
+    """Atomic write (temp file + os.replace) so a crash/power-loss mid-write
+    can never leave a corrupt checkpoint on disk -- os.replace is atomic on
+    both Windows and POSIX."""
+    tmp_path = f"{checkpoint_path}.tmp"
+    torch.save(data, tmp_path)
+    os.replace(tmp_path, checkpoint_path)
 
-    for i in _tqdm(range(0, len(forget_set), batch_size)):
+
+def get_feature_effect(model, features: list[Feature], signs, forget_set: list[str], pos_toks_ids: list[int], neg_toks_ids: list[int], batch_size=3, checkpoint_path=None):
+    """This is by far the most expensive step in discovery (one forward pass
+    per feature per text batch -- e.g. 74 features x 25 batches = 1850 passes
+    for a single restricted-layer smoke test, easily hours for a full run).
+    checkpoint_path, if given, saves (next batch index, out, sim_outs) to disk
+    after every batch and resumes from there if the file already exists, so a
+    crash/power-loss/laptop-sleep-interruption partway through doesn't lose
+    already-computed batches."""
+    resume_from = 0
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, weights_only=False)
+        resume_from = ckpt["next_batch_start"]
+        out = DefaultDict(list, ckpt["out"])
+        sim_outs = DefaultDict(list, ckpt["sim_outs"])
+        print(f"Resuming get_feature_effect from batch start index {resume_from}")
+    else:
+        out = DefaultDict(list)
+        sim_outs = DefaultDict(list)
+
+    batch_starts = list(range(0, len(forget_set), batch_size))
+
+    for i in _tqdm(batch_starts):
+        if i < resume_from:
+            continue
+
         batch = forget_set[i:i+batch_size]
         clean_logits = model(batch).softmax(dim=-1)
 
         for feature in features:
             f_concept = Concept(name=f"Feature {feature.id}", k=0.9, value=16, features=[feature])
-            with unlearn_concept(model, f_concept, full=True, signed=True, signs=signs, linscale="gemma" in model.cfg.tokenizer_name.lower()):
+            with unlearn_concept(model, f_concept, signs=signs, linscale="gemma" in model.cfg.tokenizer_name.lower()):
                 logits = model(batch).softmax(dim=-1)
 
             diff = logits[:,:,pos_toks_ids] - clean_logits[:,:,pos_toks_ids]
@@ -95,6 +125,16 @@ def get_feature_effect(model, features: list[Feature], signs, forget_set: list[s
 
             out[(feature.layer, feature.id)].extend(diff.flatten().tolist())
             sim_outs[(feature.layer, feature.id)].extend(sim_diff.flatten().tolist())
+
+        if checkpoint_path is not None:
+            _save_checkpoint(checkpoint_path, {
+                "next_batch_start": i + batch_size,
+                "out": dict(out),
+                "sim_outs": dict(sim_outs),
+            })
+
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
 
     return out, sim_outs
 
@@ -116,11 +156,12 @@ def get_feature_activations(model, features: list[Feature], forget_set: list[str
 
     return results
 
-def filter_features_by_effect_and_activations(model, features: list[Feature], forget_set: str, signs: torch.Tensor, pos_toks: list[str], neg_toks: list[str], filter_by_act=True, verbose=False):
+def filter_features_by_effect_and_activations(model, features: list[Feature], forget_set: str, signs: torch.Tensor, pos_toks: list[str], neg_toks: list[str], filter_by_act=True, verbose=False, checkpoint_dir=None):
     pos_tok_ids = [model.to_single_token(tok) for tok in pos_toks]
     neg_tok_ids = [model.to_single_token(tok) for tok in neg_toks]
 
-    pos_effects, neg_effects = get_feature_effect(model, features, signs, forget_set.splitlines(), pos_tok_ids, neg_tok_ids, batch_size=3)
+    effect_checkpoint = os.path.join(checkpoint_dir, "feature_effect.ckpt") if checkpoint_dir else None
+    pos_effects, neg_effects = get_feature_effect(model, features, signs, forget_set.splitlines(), pos_tok_ids, neg_tok_ids, batch_size=3, checkpoint_path=effect_checkpoint)
 
     final_features = []
     for feature in features:
@@ -150,23 +191,43 @@ def filter_features_by_effect_and_activations(model, features: list[Feature], fo
 
     return final_features, (pos_effects, neg_effects, activations)
 
-def filter_features_by_mmlu(model, features: list[Feature], signs: torch.Tensor, target: float | None = None, mmlu_indices: list[int] = DEFAULT_MMLU_INDICES, max_deviation: float = 0.02, verbose=False):
-    final_features = []
+def filter_features_by_mmlu(model, features: list[Feature], signs: torch.Tensor, target: float | None = None, mmlu_indices: list[int] = DEFAULT_MMLU_INDICES, max_deviation: float = 0.02, verbose=False, checkpoint_path=None):
+    """One unlearn_concept + MMLU eval per surviving feature -- also
+    expensive, also checkpointed per-feature so a crash partway through
+    doesn't redo features already scored."""
+    processed = set()
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, weights_only=False)
+        final_features = ckpt["final_features"]
+        processed = ckpt["processed"]
+        print(f"Resuming filter_features_by_mmlu: {len(processed)} features already scored")
+    else:
+        final_features = []
 
     if target is None:
         target = DEFAULT_MMLU_PERFORMANCE[model.cfg.tokenizer_name]
 
     for feature in features:
+        feature_key = (feature.layer, feature.id, feature.neg)
+        if feature_key in processed:
+            continue
+
         concept = Concept(name=f"Feature {feature.id}", k=0.9, value=16, features=[feature])
-        with unlearn_concept(model, concept, full=True, signed=True, signs=signs, linscale="gemma" in model.cfg.tokenizer_name.lower()):
+        with unlearn_concept(model, concept, signs=signs, linscale="gemma" in model.cfg.tokenizer_name.lower()):
             mmlu_res, _ = evaluate_mmlu(model, True, indices=mmlu_indices, evaluation_type=MCQAEvaluations.RANK_BASED, batch_size=3, limit=1000, verbose=False)
 
             if mmlu_res.score_from_total < target - max_deviation:
                 if verbose:
                     print(f"Filtering feature {feature.id} (layer {feature.layer}) by MMLU: mmlu={mmlu_res.score_from_total}, target={target} (difference={target - mmlu_res.score_from_total})")
-                continue
+            else:
+                final_features.append(feature)
 
-            final_features.append(feature)
+        processed.add(feature_key)
+        if checkpoint_path is not None:
+            _save_checkpoint(checkpoint_path, {"final_features": final_features, "processed": processed})
+
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
 
     return final_features
 
@@ -265,7 +326,7 @@ def find_hps(
 
         pbar.set_description(f"hps: {value}/{k} | best_harmonic: {best_harmonic:.3f} best_hps: {best_hps} [acc={best_acc:.2f}, mmlu={best_mmlu:.3f}, simdom={best_sim:.2f}]")
 
-        with unlearn_concept(model, concept, full=True, signed=True, signs=signs, linscale=linscale):
+        with unlearn_concept(model, concept, signs=signs, linscale=linscale):
             wrapped = TransformerLensModel(model)
             res = evaluate_open_ended(wrapped, evaluator, oes, verbose=False, quit_thresh=max_acc)
             concept_results["accuracy"] = res.score_from_total
