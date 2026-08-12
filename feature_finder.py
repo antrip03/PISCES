@@ -87,14 +87,55 @@ def _save_checkpoint(checkpoint_path, data):
     os.replace(tmp_path, checkpoint_path)
 
 
-def get_feature_effect(model, features: list[Feature], signs, forget_set: list[str], pos_toks_ids: list[int], neg_toks_ids: list[int], batch_size=3, checkpoint_path=None):
+def _precompute_batch_value_capacity(model, forget_set: list[str], batch_size: int, n_pos_toks: int, n_neg_toks: int) -> list[tuple[int, int]]:
+    """Tokenize-only pre-pass (no forward pass -- same technique as the
+    get_mlp_act_signs over-allocation fix) that computes, for each batch, the
+    exact number of (position x token) values it will contribute to the pos/neg
+    diff lists: batch_size_actual * seq_len * n_pos_toks and ...* n_neg_toks.
+    Used only for the early-exit worst-case bound below; irrelevant otherwise."""
+    capacities = []
+    for i in range(0, len(forget_set), batch_size):
+        batch = forget_set[i:i + batch_size]
+        toks = model.to_tokens(batch)
+        n_values = toks.shape[0] * toks.shape[1]
+        capacities.append((n_values * n_pos_toks, n_values * n_neg_toks))
+    return capacities
+
+
+def get_feature_effect(
+    model, features: list[Feature], signs, forget_set: list[str], pos_toks_ids: list[int], neg_toks_ids: list[int],
+    batch_size=3, checkpoint_path=None,
+    early_exit_after_batches: int | None = None, early_exit_margin: float = 1e-6,
+    pos_threshold: float = 0, neg_threshold: float = -2,
+):
     """This is by far the most expensive step in discovery (one forward pass
     per feature per text batch -- e.g. 74 features x 25 batches = 1850 passes
     for a single restricted-layer smoke test, easily hours for a full run).
     checkpoint_path, if given, saves (next batch index, out, sim_outs) to disk
     after every batch and resumes from there if the file already exists, so a
     crash/power-loss/laptop-sleep-interruption partway through doesn't lose
-    already-computed batches."""
+    already-computed batches.
+
+    early_exit_after_batches, if given, enables a PROVABLY-SAFE (not a
+    heuristic/approximation) early-exit: after that many batches, for each
+    still-active feature, compute the best-case-possible final pos_effect mean
+    and worst-case-possible final neg_effect mean, assuming every remaining
+    batch contributes only the most favorable values (softmax diffs are
+    bounded in [-1, 1], so this is a real, computable bound, not a guess --
+    see _precompute_batch_value_capacity for exactly how many values each
+    remaining batch can contribute). The final selection criterion (in
+    filter_features_by_effect_and_activations) is `pos_effect > pos_threshold
+    or neg_effect < neg_threshold` -- if a feature's best-possible pos_effect
+    can never exceed pos_threshold AND its worst-possible neg_effect can never
+    go below neg_threshold, no remaining batch, however favorable, can change
+    its final outcome, so it's dropped from the forward-pass loop for all
+    remaining batches. early_exit_margin adds a small extra safety margin
+    beyond the exact bound (belt-and-suspenders against floating-point
+    edge cases at the threshold itself, not needed for the bound's own
+    correctness). This changes nothing about the final selected feature set --
+    every feature reaches the exact same True/False outcome it would have
+    with early-exit disabled, just without spending compute on batches that
+    can no longer change the answer."""
     resume_from = 0
     if checkpoint_path is not None and os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, weights_only=False)
@@ -107,15 +148,27 @@ def get_feature_effect(model, features: list[Feature], signs, forget_set: list[s
         sim_outs = DefaultDict(list)
 
     batch_starts = list(range(0, len(forget_set), batch_size))
+    active_features = list(features)
+    dead_features: set[tuple[int, int]] = set()
 
-    for i in _tqdm(batch_starts):
+    remaining_pos_capacity = remaining_neg_capacity = None
+    if early_exit_after_batches is not None:
+        capacities = _precompute_batch_value_capacity(model, forget_set, batch_size, len(pos_toks_ids), len(neg_toks_ids))
+        n = len(capacities)
+        remaining_pos_capacity = [0] * (n + 1)
+        remaining_neg_capacity = [0] * (n + 1)
+        for j in range(n - 1, -1, -1):
+            remaining_pos_capacity[j] = remaining_pos_capacity[j + 1] + capacities[j][0]
+            remaining_neg_capacity[j] = remaining_neg_capacity[j + 1] + capacities[j][1]
+
+    for batch_idx, i in enumerate(_tqdm(batch_starts)):
         if i < resume_from:
             continue
 
         batch = forget_set[i:i+batch_size]
         clean_logits = model(batch).softmax(dim=-1)
 
-        for feature in features:
+        for feature in active_features:
             f_concept = Concept(name=f"Feature {feature.id}", k=0.9, value=16, features=[feature])
             with unlearn_concept(model, f_concept, signs=signs, linscale="gemma" in model.cfg.tokenizer_name.lower()):
                 logits = model(batch).softmax(dim=-1)
@@ -132,6 +185,25 @@ def get_feature_effect(model, features: list[Feature], signs, forget_set: list[s
                 "out": dict(out),
                 "sim_outs": dict(sim_outs),
             })
+
+        if early_exit_after_batches is not None and batch_idx + 1 >= early_exit_after_batches:
+            remaining_pos = remaining_pos_capacity[batch_idx + 1]
+            remaining_neg = remaining_neg_capacity[batch_idx + 1]
+            still_active = []
+            for feature in active_features:
+                key = (feature.layer, feature.id)
+                pos_vals, neg_vals = out[key], sim_outs[key]
+                n_pos, s_pos = len(pos_vals), sum(pos_vals)
+                n_neg, s_neg = len(neg_vals), sum(neg_vals)
+                best_pos_mean = (s_pos + remaining_pos) / (n_pos + remaining_pos) if (n_pos + remaining_pos) else 0
+                worst_neg_mean = (s_neg - remaining_neg) / (n_neg + remaining_neg) if (n_neg + remaining_neg) else 0
+                pos_criterion_dead = best_pos_mean <= pos_threshold - early_exit_margin
+                neg_criterion_dead = worst_neg_mean >= neg_threshold + early_exit_margin
+                if pos_criterion_dead and neg_criterion_dead:
+                    dead_features.add(key)
+                else:
+                    still_active.append(feature)
+            active_features = still_active
 
     if checkpoint_path is not None and os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
@@ -156,12 +228,21 @@ def get_feature_activations(model, features: list[Feature], forget_set: list[str
 
     return results
 
-def filter_features_by_effect_and_activations(model, features: list[Feature], forget_set: str, signs: torch.Tensor, pos_toks: list[str], neg_toks: list[str], filter_by_act=True, verbose=False, checkpoint_dir=None):
+def filter_features_by_effect_and_activations(
+    model, features: list[Feature], forget_set: str, signs: torch.Tensor, pos_toks: list[str], neg_toks: list[str],
+    filter_by_act=True, verbose=False, checkpoint_dir=None,
+    early_exit_after_batches: int | None = None, early_exit_margin: float = 1e-6,
+    batch_size: int = 3,
+):
     pos_tok_ids = [model.to_single_token(tok) for tok in pos_toks]
     neg_tok_ids = [model.to_single_token(tok) for tok in neg_toks]
 
     effect_checkpoint = os.path.join(checkpoint_dir, "feature_effect.ckpt") if checkpoint_dir else None
-    pos_effects, neg_effects = get_feature_effect(model, features, signs, forget_set.splitlines(), pos_tok_ids, neg_tok_ids, batch_size=3, checkpoint_path=effect_checkpoint)
+    pos_effects, neg_effects = get_feature_effect(
+        model, features, signs, forget_set.splitlines(), pos_tok_ids, neg_tok_ids, batch_size=batch_size, checkpoint_path=effect_checkpoint,
+        early_exit_after_batches=early_exit_after_batches, early_exit_margin=early_exit_margin,
+        pos_threshold=0, neg_threshold=-2,
+    )
 
     final_features = []
     for feature in features:
@@ -176,7 +257,7 @@ def filter_features_by_effect_and_activations(model, features: list[Feature], fo
         final_features.append(feature)
 
     if filter_by_act:
-        activations = get_feature_activations(model, features, forget_set.splitlines(), pos_toks, neg_toks, batch_size=3)
+        activations = get_feature_activations(model, features, forget_set.splitlines(), pos_toks, neg_toks, batch_size=batch_size)
 
         truly_final_features = []
         for feature in final_features:
