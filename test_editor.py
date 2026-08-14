@@ -32,7 +32,8 @@ if "sae_lens" not in sys.modules:
     fake_sae_lens.SAE = type("SAE", (), {})
     sys.modules["sae_lens"] = fake_sae_lens
 
-from editor import Feature, replace_mlp_rows  # noqa: E402
+import editor  # noqa: E402
+from editor import Feature, SAEConfig, replace_mlp_rows  # noqa: E402
 
 
 def make_fake_model(w_out: torch.Tensor):
@@ -123,6 +124,42 @@ def test_debug_mode_without_layer_features_falls_back_to_unknown(capsys):
 
     out = capsys.readouterr().out
     assert "unknown -- layer_features not provided" in out
+
+
+def test_saeconfig_get_caches_by_release_sae_id_device(monkeypatch):
+    """get_hswaps_full(_signed) call SAEConfig(...).get() once per candidate
+    feature PER BATCH (via unlearn_concept) -- for a real discovery run
+    that's thousands of calls for the exact same SAE. Without caching, each
+    one is a fresh SAE.from_pretrained load with fresh GPU tensors, which
+    was observed causing a CUDA OOM a few batches into a real Kaggle run
+    (thousands of alloc/free cycles fragmenting the caching allocator).
+    This confirms the fix: same (release, sae_id, device) returns the exact
+    same object, and only calls the real loader once; a different layer
+    (a genuinely different SAE) is NOT conflated with it."""
+    editor._SAE_CACHE.clear()
+    calls = []
+
+    class FakeLoadedSAE:
+        def float(self):
+            return self  # mirrors sae_lens SAEs already being fp32 (see editor.py's comment)
+
+    def fake_from_pretrained(release, sae_id, device):
+        calls.append((release, sae_id, device))
+        return (FakeLoadedSAE(), {"dummy": "metadata"})
+
+    monkeypatch.setattr(editor, "SAE", types.SimpleNamespace(from_pretrained=fake_from_pretrained))
+
+    cfg = SAEConfig(model_name="gemma-2-2b-it", layer=1, type="mlp", size="16k", device="cpu")
+    first = cfg.get()
+    second = cfg.get()
+    third = SAEConfig(model_name="gemma-2-2b-it", layer=1, type="mlp", size="16k", device="cpu").get()
+
+    assert first is second is third
+    assert len(calls) == 1, f"expected exactly one real load, got {len(calls)}: {calls}"
+
+    other = SAEConfig(model_name="gemma-2-2b-it", layer=2, type="mlp", size="16k", device="cpu").get()
+    assert other is not first
+    assert len(calls) == 2
 
 
 def test_debug_mode_does_not_suppress_real_edits():

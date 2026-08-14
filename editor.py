@@ -167,6 +167,12 @@ gemma_id_to_average = {
     "25-gemmascope-mlp-16k": "average_l0_126",
 }
 
+# Keyed by (release, sae_id, device); see SAEConfig.get()'s docstring for why
+# this exists -- without it, the same SAE gets reloaded from scratch on every
+# single candidate-feature edit, thousands of times over a real run.
+_SAE_CACHE: dict[tuple, "SAE"] = {}
+
+
 @dataclass
 class SAEConfig:
     model_name: Literal["gemma-2-2b", "gemma-2-2b-it", "gemma-2-9b", "gemma-2-9b-it", "llama-3-8b", "llama-3-8b-it"]
@@ -202,7 +208,23 @@ class SAEConfig:
         assert False, "Invalid model name"
         
     def get(self):
-        return SAE.from_pretrained(release = self.release, sae_id = self.sae_id, device = self.device)[0]
+        """Cached by (release, sae_id, device): get_hswaps_full(_signed) call
+        this once per candidate feature PER BATCH via unlearn_concept -- for
+        a single layer's discovery run that's candidates x batches separate
+        calls (e.g. 69 x 85 = 5865 for a real Golf/layer-1 run), all loading
+        the exact same SAE from scratch every time with no caching anywhere
+        upstream. Observed in practice as a CUDA OOM a few batches in ("Tried
+        to allocate 536.00 MiB... 1.66 GiB is reserved by PyTorch but
+        unallocated") -- thousands of ~300-400MB alloc/free cycles of an
+        unchanging SAE is exactly the pattern that fragments the caching
+        allocator until a normal-sized allocation can't find contiguous
+        space, even with nominal free memory left. The SAE is never mutated
+        by any caller (only .W_enc/.W_dec/.encode/.decode are read), so
+        sharing one instance across calls is safe."""
+        key = (self.release, self.sae_id, self.device)
+        if key not in _SAE_CACHE:
+            _SAE_CACHE[key] = SAE.from_pretrained(release=self.release, sae_id=self.sae_id, device=self.device)[0]
+        return _SAE_CACHE[key]
 
 
 @dataclass(frozen=True)
