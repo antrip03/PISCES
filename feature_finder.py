@@ -107,6 +107,7 @@ def get_feature_effect(
     batch_size=3, checkpoint_path=None,
     early_exit_after_batches: int | None = None, early_exit_margin: float = 1e-6,
     pos_threshold: float = 0, neg_threshold: float = -2,
+    debug_log_noop_edits: bool = False,
 ):
     """This is by far the most expensive step in discovery (one forward pass
     per feature per text batch -- e.g. 74 features x 25 batches = 1850 passes
@@ -170,7 +171,7 @@ def get_feature_effect(
 
         for feature in active_features:
             f_concept = Concept(name=f"Feature {feature.id}", k=0.9, value=16, features=[feature])
-            with unlearn_concept(model, f_concept, signs=signs, linscale="gemma" in model.cfg.tokenizer_name.lower()):
+            with unlearn_concept(model, f_concept, signs=signs, linscale="gemma" in model.cfg.tokenizer_name.lower(), debug_log_noop_edits=debug_log_noop_edits):
                 logits = model(batch).softmax(dim=-1)
 
             diff = logits[:,:,pos_toks_ids] - clean_logits[:,:,pos_toks_ids]
@@ -232,7 +233,7 @@ def filter_features_by_effect_and_activations(
     model, features: list[Feature], forget_set: str, signs: torch.Tensor, pos_toks: list[str], neg_toks: list[str],
     filter_by_act=True, verbose=False, checkpoint_dir=None,
     early_exit_after_batches: int | None = None, early_exit_margin: float = 1e-6,
-    batch_size: int = 3,
+    batch_size: int = 3, debug_log_noop_edits: bool = False,
 ):
     pos_tok_ids = [model.to_single_token(tok) for tok in pos_toks]
     neg_tok_ids = [model.to_single_token(tok) for tok in neg_toks]
@@ -241,7 +242,7 @@ def filter_features_by_effect_and_activations(
     pos_effects, neg_effects = get_feature_effect(
         model, features, signs, forget_set.splitlines(), pos_tok_ids, neg_tok_ids, batch_size=batch_size, checkpoint_path=effect_checkpoint,
         early_exit_after_batches=early_exit_after_batches, early_exit_margin=early_exit_margin,
-        pos_threshold=0, neg_threshold=-2,
+        pos_threshold=0, neg_threshold=-2, debug_log_noop_edits=debug_log_noop_edits,
     )
 
     final_features = []
