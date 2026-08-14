@@ -433,7 +433,7 @@ def get_hswaps_full(model, layer, features: list[Feature], k, val, all_features=
 
 @contextmanager
 @torch.no_grad()
-def replace_mlp_rows(model, all_switches, debug_log_noop_edits=False):
+def replace_mlp_rows(model, all_switches, debug_log_noop_edits=False, layer_features=None):
     """debug_log_noop_edits (default False, no change to existing behavior):
     when a layer's edit turns out to be a no-op (the post-edit W_out is
     allclose to the pre-edit backup, which normally trips the assertion
@@ -455,7 +455,14 @@ def replace_mlp_rows(model, all_switches, debug_log_noop_edits=False):
     case; a mixed-precision or skip-and-log fix in the storage-rounding
     case), so this exists to tell them apart on the next real run rather
     than guessing from the crash alone. Off by default -- the assertion
-    still fires exactly as before unless a caller opts in."""
+    still fires exactly as before unless a caller opts in.
+
+    layer_features (optional, dict[int, list[Feature]]): the Feature objects
+    steer_features was actually asked to edit at each layer -- replace_mlp_rows
+    itself only ever sees (index, new) pairs, with no feature identity, so
+    without this the debug log can say WHICH mechanism but not WHICH
+    candidate. Purely for the log message; behavior is identical whether or
+    not it's provided."""
     layer_backups = {}
     for layer, switches in all_switches.items():
         layer_backups[layer] = model.blocks[layer].mlp.W_out.clone()
@@ -469,15 +476,17 @@ def replace_mlp_rows(model, all_switches, debug_log_noop_edits=False):
         is_noop = torch.allclose(model.blocks[layer].mlp.W_out, layer_backups[layer])
 
         if is_noop and debug_log_noop_edits:
+            features = (layer_features or {}).get(layer, [])
+            feature_desc = ", ".join(f"Feature(layer={f.layer}, id={f.id}, neg={f.neg})" for f in features) or "<unknown -- layer_features not provided>"
             if not switches:
                 print(f"[replace_mlp_rows DEBUG] layer={layer}: no-op -- 0 switches were "
-                      f"computed at all (likely a dead SAE encoder column for this feature; "
-                      f"dtype-independent, not a precision issue).")
+                      f"computed at all for [{feature_desc}] (likely a dead SAE encoder "
+                      f"column for this feature; dtype-independent, not a precision issue).")
             else:
                 print(f"[replace_mlp_rows DEBUG] layer={layer}: no-op -- {len(switches)} "
-                      f"switch(es) were computed and assigned, but all rows still ended up "
-                      f"allclose to backup after storage (consistent with a storage-dtype "
-                      f"rounding collapse of an fp32-confirmed-nonzero edit).")
+                      f"switch(es) were computed and assigned for [{feature_desc}], but all "
+                      f"rows still ended up allclose to backup after storage (consistent with "
+                      f"a storage-dtype rounding collapse of an fp32-confirmed-nonzero edit).")
                 for index, new in switches:
                     old = layer_backups[layer][index]
                     delta_norm = (new.float() - old.float()).norm().item()
@@ -506,7 +515,7 @@ def steer_features(model, flayers: dict[int, list[Feature]], k: float, val: floa
             all_switches[layer] = get_hswaps_full(model, layer, features, k=k, val=val, all_features=False, linscale=linscale)
 
     # grad_enabled = torch.is_grad_enabled()
-    with replace_mlp_rows(model, all_switches, debug_log_noop_edits=debug_log_noop_edits):
+    with replace_mlp_rows(model, all_switches, debug_log_noop_edits=debug_log_noop_edits, layer_features=flayers):
         yield all_switches
 
 @contextmanager

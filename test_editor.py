@@ -32,7 +32,7 @@ if "sae_lens" not in sys.modules:
     fake_sae_lens.SAE = type("SAE", (), {})
     sys.modules["sae_lens"] = fake_sae_lens
 
-from editor import replace_mlp_rows  # noqa: E402
+from editor import Feature, replace_mlp_rows  # noqa: E402
 
 
 def make_fake_model(w_out: torch.Tensor):
@@ -95,6 +95,34 @@ def test_debug_mode_logs_and_continues_on_storage_collapsed_edit(capsys):
     out = capsys.readouterr().out
     assert "switch(es) were computed and assigned" in out
     assert "index=0" in out
+
+
+def test_debug_mode_logs_feature_id_when_layer_features_provided(capsys):
+    w_out = torch.randn(4, 3)
+    model = make_fake_model(w_out.clone())
+    dead_feature = Feature(layer=0, id=4242, neg=False)
+
+    with replace_mlp_rows(model, {0: []}, debug_log_noop_edits=True, layer_features={0: [dead_feature]}):
+        pass  # must NOT raise
+
+    out = capsys.readouterr().out
+    assert "id=4242" in out
+    assert "unknown -- layer_features not provided" not in out
+
+
+def test_debug_mode_without_layer_features_falls_back_to_unknown(capsys):
+    # layer_features omitted entirely (steer_features always passes it, but
+    # replace_mlp_rows can still be called directly) -- must not crash, and
+    # should say plainly that feature identity isn't available rather than
+    # silently omitting it.
+    w_out = torch.randn(4, 3)
+    model = make_fake_model(w_out.clone())
+
+    with replace_mlp_rows(model, {0: []}, debug_log_noop_edits=True):
+        pass
+
+    out = capsys.readouterr().out
+    assert "unknown -- layer_features not provided" in out
 
 
 def test_debug_mode_does_not_suppress_real_edits():
