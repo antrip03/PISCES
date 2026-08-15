@@ -211,21 +211,65 @@ def get_feature_effect(
 
     return out, sim_outs
 
-def get_feature_activations(model, features: list[Feature], forget_set: list[str], pos_toks: list[str], neg_toks: list[str], batch_size=3):
-    saes = get_feature_saes(model, features)
+def get_feature_activations(model, features: list[Feature], forget_set: list[str], pos_toks: list[str], neg_toks: list[str], batch_size=3, checkpoint_path=None):
+    """names_filter restricts run_with_cache_with_saes's cache to only the
+    hook_sae_acts_post tensors this function actually reads (one per unique
+    layer in `features`) -- by default run_with_cache(_with_saes) caches
+    every hook point across the WHOLE model (every layer's residual stream,
+    attention internals, MLP internals), which is far more than needed here
+    and was observed causing a CUDA OOM partway through a real 85-batch
+    Golf/layer-1 run (14.54/14.56 GiB in use, 18.81 MiB free) even though
+    only layer 1's SAE activations are ever read. Not verified against the
+    real failure directly (no GPU on this machine) -- names_filter itself is
+    a long-standing, stable transformer_lens run_with_cache parameter, and
+    the traceback shows run_with_cache_with_saes forwards to self.run_with_cache,
+    but whether it actually eliminates this specific OOM needs confirming on
+    a real rerun.
 
-    results = DefaultDict(int)
+    checkpoint_path, if given, saves (next batch index, results so far) to
+    disk after every batch and resumes from there if the file already
+    exists -- mirrors get_feature_effect's own checkpointing. This function
+    previously had none, meaning a crash here (which just happened on a real
+    run) meant redoing the entire, much more expensive effect-measurement
+    stage that necessarily runs before this one, for nothing."""
+    saes = get_feature_saes(model, features)
+    needed_hooks = {f"blocks.{feature.layer}.hook_mlp_out.hook_sae_acts_post" for feature in features}
+
+    resume_from = 0
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, weights_only=False)
+        resume_from = ckpt["next_batch_start"]
+        results = DefaultDict(int, ckpt["results"])
+        print(f"Resuming get_feature_activations from batch start index {resume_from}")
+    else:
+        results = DefaultDict(int)
+
     for i in _tqdm(range(0, len(forget_set), batch_size)):
+        if i < resume_from:
+            continue
+
         batch = forget_set[i:i+batch_size]
 
-        cache = model.run_with_cache_with_saes(batch, saes=saes, return_type=None)[1]
+        cache = model.run_with_cache_with_saes(batch, saes=saes, return_type=None, names_filter=lambda name: name in needed_hooks)[1]
 
         for feature in features:
-        
-            # Get positions where feature fired
+
+            # Get positions where feature fired -- .item() immediately (not
+            # accumulating a GPU tensor across up to 85 batches) so results
+            # holds plain Python ints, same discipline as get_feature_effect's
+            # own .tolist() calls.
             firing_positions = (cache[f"blocks.{feature.layer}.hook_mlp_out.hook_sae_acts_post"][:,:,feature.id] > 0)
-            firings = firing_positions.sum()
+            firings = int(firing_positions.sum().item())
             results[(feature.layer, feature.id)] += firings
+
+        if checkpoint_path is not None:
+            _save_checkpoint(checkpoint_path, {
+                "next_batch_start": i + batch_size,
+                "results": dict(results),
+            })
+
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
 
     return results
 
@@ -258,7 +302,11 @@ def filter_features_by_effect_and_activations(
         final_features.append(feature)
 
     if filter_by_act:
-        activations = get_feature_activations(model, features, forget_set.splitlines(), pos_toks, neg_toks, batch_size=batch_size)
+        activation_checkpoint = os.path.join(checkpoint_dir, "feature_activations.ckpt") if checkpoint_dir else None
+        activations = get_feature_activations(
+            model, features, forget_set.splitlines(), pos_toks, neg_toks, batch_size=batch_size,
+            checkpoint_path=activation_checkpoint,
+        )
 
         truly_final_features = []
         for feature in final_features:
