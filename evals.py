@@ -607,8 +607,14 @@ def evaluate_familiarity(model: AbstractModel, evaluator: AbstractEvaluator, pro
     return evaluator.evaluate_familiarity(prompts, answers)
 
 def evaluate_mmlu(model, it, tokenizer=None, limit=300, indices=None, shuffle=True, batch_size=10, verbose=True, evaluation_type: MCQAEvaluations = MCQAEvaluations.NEXT_TOKEN):
-    ds = load_dataset("cais/mmlu", "all")
-    qs = parse_questions_from_hf(ds["test"].to_list())
+    # split="test": only ds["test"] is ever read below, but load_dataset("cais/mmlu", "all")
+    # without a split= argument eagerly generates EVERY split in the "all" config --
+    # test, validation, dev, AND auxiliary_train (99,842 rows, never touched by this
+    # function at all) -- observed on a real Kaggle run as a multi-minute stall the
+    # first time evaluate_mmlu is called, entirely spent generating a split nothing
+    # downstream reads. split="test" loads only what's actually used.
+    ds = load_dataset("cais/mmlu", "all", split="test")
+    qs = parse_questions_from_hf(ds.to_list())
 
     if shuffle and not indices:
         indices = random.sample(range(len(qs)), limit)
