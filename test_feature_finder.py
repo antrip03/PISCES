@@ -33,13 +33,17 @@ if "evals" not in sys.modules:
     fake_evals = types.ModuleType("evals")
     for _name in (
         "eval_alpaca", "TransformerLensModel", "GeminiEvaluator", "evaluate_mmlu",
-        "MCQAEvaluations", "evaluate_open_ended", "OpenEndedQuestion",
+        "evaluate_open_ended", "OpenEndedQuestion",
     ):
         setattr(fake_evals, _name, type(_name, (), {}))
+    # feature_finder.py references MCQAEvaluations.RANK_BASED as a plain
+    # attribute access (not just an import), so the stub needs that member.
+    fake_evals.MCQAEvaluations = type("MCQAEvaluations", (), {"RANK_BASED": "RANK_BASED", "NEXT_TOKEN": "NEXT_TOKEN"})
     sys.modules["evals"] = fake_evals
 
+import feature_finder  # noqa: E402
 from editor import Feature  # noqa: E402
-from feature_finder import get_feature_activations  # noqa: E402
+from feature_finder import filter_features_by_mmlu, get_feature_activations  # noqa: E402
 
 
 class FakeModelForActivations:
@@ -130,3 +134,34 @@ def test_checkpoint_resume_skips_completed_batches_and_accumulates(tmp_path):
 
     import os
     assert not os.path.exists(ckpt), "checkpoint should be cleaned up after successful completion"
+
+
+def test_filter_features_by_mmlu_forwards_debug_log_noop_edits(monkeypatch):
+    """filter_features_by_mmlu has its OWN unlearn_concept call site, separate
+    from get_feature_effect's -- a real Kaggle run crashed here with the bare
+    "No changes made to the model" AssertionError because this call site
+    wasn't wired to debug_log_noop_edits at all (only get_feature_effect's
+    was). Mocks unlearn_concept itself (not the full SAE-editing machinery
+    already covered by test_editor.py) to isolate exactly this regression:
+    does the kwarg actually reach the call, in both directions."""
+    from contextlib import contextmanager
+
+    captured = []
+
+    @contextmanager
+    def fake_unlearn_concept(model, concept, signs=None, linscale=False, debug_log_noop_edits=False):
+        captured.append(debug_log_noop_edits)
+        yield
+
+    monkeypatch.setattr(feature_finder, "unlearn_concept", fake_unlearn_concept)
+    monkeypatch.setattr(feature_finder, "evaluate_mmlu", lambda *a, **k: (types.SimpleNamespace(score_from_total=0.9), None))
+
+    model = types.SimpleNamespace(cfg=types.SimpleNamespace(tokenizer_name="gemma-2-2b-it"))
+    features = [Feature(layer=1, id=42, neg=False)]
+
+    filter_features_by_mmlu(model, features, signs=None, target=0.5, debug_log_noop_edits=True)
+    assert captured == [True]
+
+    captured.clear()
+    filter_features_by_mmlu(model, features, signs=None, target=0.5)
+    assert captured == [False], "default must stay False -- no change to existing behavior for callers that don't opt in"

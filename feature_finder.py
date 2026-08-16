@@ -321,10 +321,28 @@ def filter_features_by_effect_and_activations(
 
     return final_features, (pos_effects, neg_effects, activations)
 
-def filter_features_by_mmlu(model, features: list[Feature], signs: torch.Tensor, target: float | None = None, mmlu_indices: list[int] = DEFAULT_MMLU_INDICES, max_deviation: float = 0.02, verbose=False, checkpoint_path=None):
+def filter_features_by_mmlu(
+    model, features: list[Feature], signs: torch.Tensor, target: float | None = None, mmlu_indices: list[int] = DEFAULT_MMLU_INDICES,
+    max_deviation: float = 0.02, verbose=False, checkpoint_path=None, debug_log_noop_edits: bool = False,
+):
     """One unlearn_concept + MMLU eval per surviving feature -- also
     expensive, also checkpointed per-feature so a crash partway through
-    doesn't redo features already scored."""
+    doesn't redo features already scored.
+
+    debug_log_noop_edits: this function has its OWN separate unlearn_concept
+    call site (get_feature_effect has a different one) -- a candidate that
+    reaches this function isn't necessarily one whose edit works. The effect
+    filter alone (filter_features_by_effect_and_activations's pos_effect > 0
+    or neg_effect < -2 check) does NOT remove a feature whose edit was a
+    no-op the whole time it was measured: pos_effect=0 and neg_effect=0 both
+    fail that condition, so a genuinely-inert candidate is KEPT by the
+    effect check, not dropped -- only the separate real-forward-pass
+    activation check (filter_by_act) is positioned to catch it, and that
+    checks something different (whether the feature's encoder fires on real
+    text) than whether get_hswaps_full(_signed) can find a qualifying
+    weight-edit for it. So the same "No changes made to the model" crash
+    that get_feature_effect already handles gracefully can recur here,
+    unprotected, unless this is wired the same way."""
     processed = set()
     if checkpoint_path is not None and os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, weights_only=False)
@@ -343,7 +361,7 @@ def filter_features_by_mmlu(model, features: list[Feature], signs: torch.Tensor,
             continue
 
         concept = Concept(name=f"Feature {feature.id}", k=0.9, value=16, features=[feature])
-        with unlearn_concept(model, concept, signs=signs, linscale="gemma" in model.cfg.tokenizer_name.lower()):
+        with unlearn_concept(model, concept, signs=signs, linscale="gemma" in model.cfg.tokenizer_name.lower(), debug_log_noop_edits=debug_log_noop_edits):
             mmlu_res, _ = evaluate_mmlu(model, True, indices=mmlu_indices, evaluation_type=MCQAEvaluations.RANK_BASED, batch_size=3, limit=1000, verbose=False)
 
             if mmlu_res.score_from_total < target - max_deviation:
