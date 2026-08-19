@@ -33,7 +33,7 @@ if "sae_lens" not in sys.modules:
     sys.modules["sae_lens"] = fake_sae_lens
 
 import editor  # noqa: E402
-from editor import Feature, SAEConfig, replace_mlp_rows  # noqa: E402
+from editor import Feature, SAEConfig, get_mlp_act_signs, replace_mlp_rows  # noqa: E402
 
 
 def make_fake_model(w_out: torch.Tensor):
@@ -172,3 +172,59 @@ def test_debug_mode_does_not_suppress_real_edits():
         assert torch.allclose(model.blocks[0].mlp.W_out[2], new_row)
 
     assert torch.allclose(model.blocks[0].mlp.W_out, original)
+
+
+class FakeModelForActSigns:
+    """Stands in for model.run_with_cache: returns a cache dict containing
+    only the hook tensors whose name passes names_filter -- mirrors the real
+    run_with_cache closely enough to test the restriction without a real
+    model. Includes a hook get_mlp_act_signs never reads (an attention
+    pattern) so the test can prove names_filter actually excludes it, not
+    just that a filter callable was passed."""
+
+    def __init__(self, n_layers=2, d_mlp=3):
+        self.cfg = types.SimpleNamespace(n_layers=n_layers, d_mlp=d_mlp)
+        self.calls: list[object] = []  # names_filter per call
+        self._token_ids = {" a": 1, " b": 2}
+        self._line_tokens = {"a": 1, "b": 2}
+
+    def to_single_token(self, token):
+        return self._token_ids[token]
+
+    def to_tokens(self, batch):
+        return torch.tensor([[self._line_tokens[line]] for line in batch])
+
+    def run_with_cache(self, batch, return_type=None, names_filter=None):
+        self.calls.append(names_filter)
+        cache = {}
+        for layer in range(self.cfg.n_layers):
+            hook_name = f"blocks.{layer}.mlp.hook_post"
+            if names_filter is None or names_filter(hook_name):
+                cache[hook_name] = torch.zeros(len(batch), 1, self.cfg.d_mlp)
+        untouched_hook = "blocks.0.attn.hook_pattern"
+        if names_filter is None or names_filter(untouched_hook):
+            cache[untouched_hook] = torch.zeros(1)
+        return None, cache
+
+
+def test_get_mlp_act_signs_names_filter_excludes_unread_hooks():
+    """Real Kaggle T4 run hit a CUDA OOM inside get_mlp_act_signs
+    (run_with_cache caching every hook point across the whole model --
+    attention patterns, residual stream, etc. -- not just the
+    blocks.{layer}.mlp.hook_post tensors this function reads), 19/83 batches
+    in: '14.54 GiB memory in use' of '14.56 GiB' total -- the same ceiling
+    get_feature_activations hit before its own names_filter fix. This
+    verifies the fix actually restricts the cache instead of just changing a
+    comment."""
+    model = FakeModelForActSigns(n_layers=2, d_mlp=3)
+
+    # Callers (discover.py/run_kaggle.py) always pass an already-split list
+    # of lines (forget_text.splitlines()[:1000]), not a raw string.
+    get_mlp_act_signs(model, [" a"], ["a", "b"], batch_size=1)
+
+    assert len(model.calls) == 2, "one run_with_cache call per batch (2 lines, batch_size=1)"
+    for names_filter in model.calls:
+        assert names_filter is not None, "names_filter must be passed, not left as the caching-everything default"
+        assert names_filter("blocks.0.mlp.hook_post")
+        assert names_filter("blocks.1.mlp.hook_post")
+        assert not names_filter("blocks.0.attn.hook_pattern"), "must exclude hooks this function never reads"

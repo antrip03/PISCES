@@ -252,6 +252,19 @@ class Concept(DataClassJsonMixin):
 
 def get_mlp_act_signs(model, tokens, text, batch_size=3):
     token_ids = [model.to_single_token(token) for token in tokens]
+    # names_filter restricts run_with_cache's cache to only the
+    # blocks.{layer}.mlp.hook_post tensors the loop below actually reads --
+    # same fix, same root cause, as get_feature_activations's names_filter in
+    # feature_finder.py (see that function's docstring): by default
+    # run_with_cache retains every hook point across the WHOLE model (every
+    # layer's residual stream, attention internals incl. attention patterns,
+    # MLP internals), not just the one tensor per layer this function needs.
+    # Observed causing a CUDA OOM on a real Kaggle T4 run partway through
+    # get_mlp_act_signs (19/83 batches in -- not batch 1, consistent with
+    # gradual accumulation rather than one huge single-batch allocation):
+    # "14.54 GiB memory in use" of "14.56 GiB" total, the same ceiling
+    # get_feature_activations hit before its own names_filter fix.
+    needed_hooks = {f"blocks.{layer}.mlp.hook_post" for layer in range(model.cfg.n_layers)}
 
     # The original hardcoded n_prompts=100000 here pre-allocates a
     # (n_layers, d_mlp, 100000) float32 buffer regardless of input size --
@@ -277,7 +290,7 @@ def get_mlp_act_signs(model, tokens, text, batch_size=3):
         batch = text[i:i+batch_size]
 
         toks = model.to_tokens(batch)
-        cache = model.run_with_cache(batch, return_type=None)[1]
+        cache = model.run_with_cache(batch, return_type=None, names_filter=lambda name: name in needed_hooks)[1]
 
         for i in range(len(toks)):
             batch_toks = toks[i]
