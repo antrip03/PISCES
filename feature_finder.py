@@ -1,4 +1,5 @@
 import os
+import time
 import torch
 import json
 import random
@@ -324,6 +325,7 @@ def filter_features_by_effect_and_activations(
 def filter_features_by_mmlu(
     model, features: list[Feature], signs: torch.Tensor, target: float | None = None, mmlu_indices: list[int] = DEFAULT_MMLU_INDICES,
     max_deviation: float = 0.02, verbose=False, checkpoint_path=None, debug_log_noop_edits: bool = False,
+    progress_log: bool = False,
 ):
     """One unlearn_concept + MMLU eval per surviving feature -- also
     expensive, also checkpointed per-feature so a crash partway through
@@ -342,7 +344,18 @@ def filter_features_by_mmlu(
     text) than whether get_hswaps_full(_signed) can find a qualifying
     weight-edit for it. So the same "No changes made to the model" crash
     that get_feature_effect already handles gracefully can recur here,
-    unprotected, unless this is wired the same way."""
+    unprotected, unless this is wired the same way.
+
+    progress_log: this stage has no tqdm bar and, previously, printed
+    nothing at all unless a candidate failed MMLU under verbose=True -- a
+    real run went silent for over an hour on this exact stage (up to ~10min
+    per candidate x dozens of candidates, each doing a ~334-batch MCQA eval
+    with its own verbose=False tqdm suppressed), and there was no way to
+    tell "still working" from "hung" without watching GPU utilization
+    externally. When True, prints one line before each candidate starts
+    (with its index/total and elapsed time since this call began) and one
+    after it finishes (with its score and keep/drop outcome), independent
+    of `verbose` (which only ever covered the drop case)."""
     processed = set()
     if checkpoint_path is not None and os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, weights_only=False)
@@ -355,20 +368,28 @@ def filter_features_by_mmlu(
     if target is None:
         target = DEFAULT_MMLU_PERFORMANCE[model.cfg.tokenizer_name]
 
-    for feature in features:
+    start_time = time.monotonic()
+    remaining = [f for f in features if (f.layer, f.id, f.neg) not in processed]
+    for i, feature in enumerate(remaining):
         feature_key = (feature.layer, feature.id, feature.neg)
-        if feature_key in processed:
-            continue
+
+        if progress_log:
+            elapsed = time.monotonic() - start_time
+            print(f"  MMLU [{i+1}/{len(remaining)}] (+{elapsed:.0f}s) scoring {feature}...", flush=True)
 
         concept = Concept(name=f"Feature {feature.id}", k=0.9, value=16, features=[feature])
         with unlearn_concept(model, concept, signs=signs, linscale="gemma" in model.cfg.tokenizer_name.lower(), debug_log_noop_edits=debug_log_noop_edits):
             mmlu_res, _ = evaluate_mmlu(model, True, indices=mmlu_indices, evaluation_type=MCQAEvaluations.RANK_BASED, batch_size=3, limit=1000, verbose=False)
 
-            if mmlu_res.score_from_total < target - max_deviation:
+            kept = mmlu_res.score_from_total >= target - max_deviation
+            if not kept:
                 if verbose:
                     print(f"Filtering feature {feature.id} (layer {feature.layer}) by MMLU: mmlu={mmlu_res.score_from_total}, target={target} (difference={target - mmlu_res.score_from_total})")
             else:
                 final_features.append(feature)
+
+            if progress_log:
+                print(f"    -> mmlu={mmlu_res.score_from_total:.4f} target={target:.4f} {'KEPT' if kept else 'DROPPED'}", flush=True)
 
         processed.add(feature_key)
         if checkpoint_path is not None:

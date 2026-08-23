@@ -165,3 +165,32 @@ def test_filter_features_by_mmlu_forwards_debug_log_noop_edits(monkeypatch):
     captured.clear()
     filter_features_by_mmlu(model, features, signs=None, target=0.5)
     assert captured == [False], "default must stay False -- no change to existing behavior for callers that don't opt in"
+
+
+def test_filter_features_by_mmlu_progress_log(monkeypatch, capsys):
+    """The MMLU stage has no tqdm bar and printed nothing at all by default --
+    a real run went silent for over an hour on this exact stage with no way
+    to tell "still working" from "hung" short of watching GPU utilization
+    externally. progress_log=True must print per-candidate, independent of
+    verbose (which only ever covered the drop case); default False must stay
+    silent (no change for existing callers)."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_unlearn_concept(model, concept, signs=None, linscale=False, debug_log_noop_edits=False):
+        yield
+
+    monkeypatch.setattr(feature_finder, "unlearn_concept", fake_unlearn_concept)
+    monkeypatch.setattr(feature_finder, "evaluate_mmlu", lambda *a, **k: (types.SimpleNamespace(score_from_total=0.9), None))
+
+    model = types.SimpleNamespace(cfg=types.SimpleNamespace(tokenizer_name="gemma-2-2b-it"))
+    features = [Feature(layer=1, id=42, neg=False), Feature(layer=2, id=7, neg=True)]
+
+    filter_features_by_mmlu(model, features, signs=None, target=0.5, progress_log=True)
+    out = capsys.readouterr().out
+    assert "[1/2]" in out and "[2/2]" in out
+    assert "KEPT" in out
+
+    filter_features_by_mmlu(model, features, signs=None, target=0.5)
+    out = capsys.readouterr().out
+    assert out == "", "default (progress_log=False) must stay silent -- no change to existing behavior"
