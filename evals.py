@@ -509,7 +509,12 @@ class GeminiEvaluator(AbstractEvaluator):
     def _send_request(self, prompt: str) -> str:
         for _ in range(10):
             try:
-                response = self.model.generate_content(prompt)
+                # request_options timeout is required -- without it, a stalled
+                # connection to the API blocks forever with no exception ever
+                # raised, so this retry loop never triggers (observed hanging
+                # 9+ minutes on GCP with zero data exchanged on an ESTABLISHED
+                # socket).
+                response = self.model.generate_content(prompt, request_options={"timeout": 60})
                 fr = response.candidates[0].finish_reason
                 assert fr == 1, f"Bad finish reason: {fr.value}:{fr.name}"
                 return response.text
