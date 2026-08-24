@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import threading
 from transformers import PreTrainedModel
 
 from tqdm import tqdm as _tqdm
@@ -508,19 +509,47 @@ class GeminiEvaluator(AbstractEvaluator):
 
     def _send_request(self, prompt: str) -> str:
         for _ in range(10):
+            # A plain call can block forever with no exception ever raised on
+            # a stalled connection -- observed hanging 9+ min on GCP with zero
+            # data on an ESTABLISHED socket, and confirmed that
+            # generate_content's own request_options={"timeout": ...} does
+            # NOT reliably bound this on this (deprecated) SDK: the same hang
+            # recurred even with that set, past the point this loop should
+            # have exhausted all 10 attempts and raised. Using a real
+            # thread-level timeout instead, independent of whatever the SDK
+            # does internally. A raw daemon thread, not
+            # concurrent.futures.ThreadPoolExecutor -- its worker threads are
+            # NOT daemon threads, so an abandoned one would make the whole
+            # interpreter hang at exit (both threading's own shutdown and
+            # concurrent.futures.thread's atexit hook join every live
+            # non-daemon thread), silently blocking run_erasure_eval.py from
+            # ever returning even after this concept's result is already
+            # written and pushed. daemon=True lets Python exit immediately,
+            # abandoning the stuck thread rather than waiting on it forever.
+            result_box: dict = {}
+
+            def _call():
+                try:
+                    result_box["response"] = self.model.generate_content(prompt, request_options={"timeout": 60})
+                except Exception as e:
+                    result_box["error"] = e
+
+            thread = threading.Thread(target=_call, daemon=True)
+            thread.start()
+            thread.join(timeout=90)
+
             try:
-                # request_options timeout is required -- without it, a stalled
-                # connection to the API blocks forever with no exception ever
-                # raised, so this retry loop never triggers (observed hanging
-                # 9+ minutes on GCP with zero data exchanged on an ESTABLISHED
-                # socket).
-                response = self.model.generate_content(prompt, request_options={"timeout": 60})
+                if thread.is_alive():
+                    raise TimeoutError("generate_content did not return within 90s")
+                if "error" in result_box:
+                    raise result_box["error"]
+                response = result_box["response"]
                 fr = response.candidates[0].finish_reason
                 assert fr == 1, f"Bad finish reason: {fr.value}:{fr.name}"
                 return response.text
 
             except Exception as e:
-                print(f"Got error: {e}, retrying...")
+                print(f"Got error: {e}, retrying...", flush=True)
                 time.sleep(5)
 
         raise ValueError("Failed to get a valid response from Gemini")
