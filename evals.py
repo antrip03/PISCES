@@ -23,7 +23,7 @@ from dataclasses_json import DataClassJsonMixin
 from peft.tuners.lora import LoraConfig
 from peft import get_peft_model
 from torch.optim import AdamW
-from google import generativeai as gai
+from google import genai
 import gc
 
 ################### Classes ###################
@@ -503,34 +503,41 @@ class OpenAIEvaluator(AbstractEvaluator):
         return completion.choices[0].message.content
 
 class GeminiEvaluator(AbstractEvaluator):
-    def __init__(self, model_name: str = "models/gemini-flash-latest"):
-        gai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        self.model = gai.GenerativeModel(model_name)
+    def __init__(self, model_name: str = "gemini-2.5-flash"):
+        # Vertex AI via the GCP service account's Application Default
+        # Credentials -- billed against the project's normal Cloud Billing
+        # account, same one that pays for the GCE instance this runs on.
+        # Deliberately NOT the Developer API (aistudio.google.com API key,
+        # what `google.generativeai`/`gai.configure(api_key=...)` used to
+        # hit): that runs on its own separate "prepay" balance decoupled
+        # from Cloud Billing, capped at a 20-request/day free tier until
+        # separately topped up in AI Studio -- the actual root cause of
+        # this evaluator hanging for 9+ minutes at a time (the SDK's
+        # internal retry-on-429 backoff, not a network stall).
+        self.client = genai.Client(
+            vertexai=True,
+            project=os.getenv("GOOGLE_CLOUD_PROJECT", "steering-505317"),
+            location=os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1"),
+        )
+        self.model_name = model_name
 
     def _send_request(self, prompt: str) -> str:
         for _ in range(10):
-            # A plain call can block forever with no exception ever raised on
-            # a stalled connection -- observed hanging 9+ min on GCP with zero
-            # data on an ESTABLISHED socket, and confirmed that
-            # generate_content's own request_options={"timeout": ...} does
-            # NOT reliably bound this on this (deprecated) SDK: the same hang
-            # recurred even with that set, past the point this loop should
-            # have exhausted all 10 attempts and raised. Using a real
-            # thread-level timeout instead, independent of whatever the SDK
-            # does internally. A raw daemon thread, not
-            # concurrent.futures.ThreadPoolExecutor -- its worker threads are
-            # NOT daemon threads, so an abandoned one would make the whole
-            # interpreter hang at exit (both threading's own shutdown and
-            # concurrent.futures.thread's atexit hook join every live
-            # non-daemon thread), silently blocking run_erasure_eval.py from
-            # ever returning even after this concept's result is already
-            # written and pushed. daemon=True lets Python exit immediately,
-            # abandoning the stuck thread rather than waiting on it forever.
+            # Still worth a hard external timeout even on Vertex (the prior
+            # AI-Studio-backend hang was ultimately a quota issue, not
+            # something specific to that SDK) -- a raw daemon thread, not
+            # concurrent.futures.ThreadPoolExecutor, whose worker threads are
+            # NOT daemon threads and would otherwise make the whole
+            # interpreter hang at exit waiting to join an abandoned one
+            # (both threading's own shutdown and concurrent.futures.thread's
+            # atexit hook join every live non-daemon thread), silently
+            # blocking run_erasure_eval.py from ever returning even after
+            # this concept's result is already written and pushed.
             result_box: dict = {}
 
             def _call():
                 try:
-                    result_box["response"] = self.model.generate_content(prompt, request_options={"timeout": 60})
+                    result_box["response"] = self.client.models.generate_content(model=self.model_name, contents=prompt)
                 except Exception as e:
                     result_box["error"] = e
 
@@ -545,7 +552,9 @@ class GeminiEvaluator(AbstractEvaluator):
                     raise result_box["error"]
                 response = result_box["response"]
                 fr = response.candidates[0].finish_reason
-                assert fr == 1, f"Bad finish reason: {fr.value}:{fr.name}"
+                # fr is a FinishReason enum member -- str(fr) gives
+                # "FinishReason.STOP", not "STOP"; .name is the bare value.
+                assert fr.name == "STOP", f"Bad finish reason: {fr}"
                 return response.text
 
             except Exception as e:
